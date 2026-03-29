@@ -1,0 +1,35 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfplan
+.terraform.lock.hcl
+terraform-outputs.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.pytest_cache
+test-results.xml
+.coverage
+
+# Node
+node_modules/
+frontend/build/
+
+# Docker
+.dockerignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# NEVER commit secrets
+*.pem
+*.key
+.env
+secrets/

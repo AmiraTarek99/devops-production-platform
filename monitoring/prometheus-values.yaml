@@ -1,0 +1,34 @@
+fullnameOverride: monitoring
+
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+
+grafana:
+  enabled: true
+  adminPassword: "DevOpsAdmin123"
+  persistence:
+    enabled: true
+    size: 5Gi
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+      - name: default
+        folder: DevOps Platform
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards/default
+
+alertmanager:
+  enabled: true
+
+nodeExporter:
+  enabled: true    # Node-level CPU/memory/disk metrics

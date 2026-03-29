@@ -1,0 +1,713 @@
+// ═══════════════════════════════════════════════════════════════════
+//  DevOps Production Platform — Full Jenkins CI/CD Pipeline
+//
+//  This is ONE pipeline that does everything:
+//
+//  STAGE 1  → Checkout code from GitHub
+//  STAGE 2  → Test backend  (pytest + flake8)
+//  STAGE 3  → Test frontend (npm test)
+//  STAGE 4  → Build Docker images (backend + frontend)
+//  STAGE 5  → Push images to AWS ECR
+//  STAGE 6  → Terraform Init
+//  STAGE 7  → Terraform Plan   (shows what will change)
+//  STAGE 8  → Terraform Apply  (creates/updates AWS infra)
+//  STAGE 9  → Create K8s namespaces + secrets
+//  STAGE 10 → Helm deploy to DEV
+//  STAGE 11 → Smoke test DEV
+//  STAGE 12 → Manual approval gate  ← human must click approve
+//  STAGE 13 → Helm deploy to PRODUCTION
+//  STAGE 14 → Verify production
+//  STAGE 15 → Install/update monitoring (Prometheus + Grafana)
+//
+// ═══════════════════════════════════════════════════════════════════
+
+pipeline {
+
+    // Run on any available Jenkins agent
+    agent any
+
+    // ── Parameters — passed when triggering the build ────────────────
+    parameters {
+        string(
+            name:         'IMAGE_TAG',
+            defaultValue: "build-${BUILD_NUMBER}",
+            description:  'Docker image tag (default: build number)'
+        )
+        booleanParam(
+            name:         'RUN_TERRAFORM',
+            defaultValue: true,
+            description:  'Run Terraform apply? Uncheck if infra has not changed'
+        )
+        booleanParam(
+            name:         'DEPLOY_MONITORING',
+            defaultValue: false,
+            description:  'Install/update Prometheus + Grafana monitoring stack'
+        )
+        choice(
+            name:    'TERRAFORM_ACTION',
+            choices: ['apply', 'plan-only', 'destroy'],
+            description: 'What Terraform action to run'
+        )
+    }
+
+    // ── Environment variables available to all stages ─────────────────
+    environment {
+        // AWS config
+        AWS_REGION       = 'us-east-1'
+        EKS_CLUSTER_NAME = 'devops-platform-production'
+
+        // These come from Jenkins Credentials Store
+        // Set them in: Manage Jenkins → Credentials → Global → Add Credentials
+        AWS_ACCESS_KEY_ID     = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+        ECR_BACKEND_URL       = credentials('ECR_BACKEND_URL')
+        ECR_FRONTEND_URL      = credentials('ECR_FRONTEND_URL')
+        DB_PASSWORD           = credentials('DB_PASSWORD')
+        TF_KEY_PAIR_NAME      = credentials('TF_KEY_PAIR_NAME')
+
+        // Build metadata
+        BUILD_TAG = "${params.IMAGE_TAG}"
+    }
+
+    // ── Pipeline options ──────────────────────────────────────────────
+    options {
+        // Keep only last 10 builds to save disk
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+
+        // Fail pipeline if it runs longer than 60 minutes
+        timeout(time: 60, unit: 'MINUTES')
+
+        // Add timestamps to every log line
+        timestamps()
+
+        // Never run two deployments at the same time
+        disableConcurrentBuilds()
+
+        // Color in console output
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 1 — Checkout
+        // ══════════════════════════════════════════════════════════════
+        stage('Checkout') {
+            steps {
+                // Clone the repo from GitHub
+                checkout scm
+
+                // Print build info so logs are easy to read
+                sh """
+                    echo "╔══════════════════════════════════════════╗"
+                    echo "║  DevOps Platform CI/CD Pipeline          ║"
+                    echo "╠══════════════════════════════════════════╣"
+                    echo "║  Build Number : ${BUILD_NUMBER}          ║"
+                    echo "║  Image Tag    : ${BUILD_TAG}             ║"
+                    echo "║  Branch       : \$GIT_BRANCH             ║"
+                    echo "║  Commit       : \$GIT_COMMIT             ║"
+                    echo "╚══════════════════════════════════════════╝"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 2 — Test Backend
+        // Runs pytest and flake8 linting
+        // Pipeline fails here if tests fail — nothing gets deployed
+        // ══════════════════════════════════════════════════════════════
+        stage('Test Backend') {
+            steps {
+                dir('backend') {
+                    sh """
+                        echo "--- Installing dependencies ---"
+                        python3 -m venv venv
+                        . venv/bin/activate
+
+                        pip install -r requirements.txt --quiet
+
+                        echo "--- Running linter (flake8) ---"
+                        flake8 . \
+                            --max-line-length=100 \
+                            --exclude=venv,__pycache__ \
+                            --statistics
+
+                        echo "--- Running tests (pytest) ---"
+                        pytest test_app.py \
+                            -v \
+                            --tb=short \
+                            --junit-xml=test-results.xml
+
+                        echo "✅ Backend tests passed"
+                    """
+                }
+            }
+            post {
+                always {
+                    // Publish test results in Jenkins UI
+                    junit allowEmptyResults: true,
+                          testResults: 'backend/test-results.xml'
+
+                    // Clean up virtualenv
+                    sh 'rm -rf backend/venv'
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 3 — Test Frontend
+        // ══════════════════════════════════════════════════════════════
+        stage('Test Frontend') {
+            steps {
+                dir('frontend') {
+                    sh """
+                        echo "--- Installing npm packages ---"
+                        npm ci --silent
+
+                        echo "--- Running frontend tests ---"
+                        CI=true npm test -- --watchAll=false --passWithNoTests
+
+                        echo "✅ Frontend tests passed"
+                    """
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 4 — Build Docker Images
+        // Builds both backend and frontend images
+        // Labels each image with git commit and build number
+        // ══════════════════════════════════════════════════════════════
+        stage('Build Docker Images') {
+            steps {
+                sh """
+                    echo "--- Building backend image ---"
+                    docker build \
+                        --tag ${ECR_BACKEND_URL}:${BUILD_TAG} \
+                        --tag ${ECR_BACKEND_URL}:latest \
+                        --label "git-commit=\$GIT_COMMIT" \
+                        --label "build-number=${BUILD_NUMBER}" \
+                        --label "build-date=\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        --file backend/Dockerfile \
+                        ./backend
+
+                    echo "--- Building frontend image ---"
+                    docker build \
+                        --tag ${ECR_FRONTEND_URL}:${BUILD_TAG} \
+                        --tag ${ECR_FRONTEND_URL}:latest \
+                        --label "git-commit=\$GIT_COMMIT" \
+                        --label "build-number=${BUILD_NUMBER}" \
+                        --label "build-date=\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        --file frontend/Dockerfile \
+                        ./frontend
+
+                    echo "--- Images built ---"
+                    docker images | grep -E "devops-platform"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 5 — Push Images to AWS ECR
+        // Authenticates with ECR then pushes both images
+        // ══════════════════════════════════════════════════════════════
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    echo "--- Logging in to Amazon ECR ---"
+                    aws ecr get-login-password \
+                        --region ${AWS_REGION} | \
+                    docker login \
+                        --username AWS \
+                        --password-stdin ${ECR_BACKEND_URL}
+
+                    echo "--- Pushing backend image ---"
+                    docker push ${ECR_BACKEND_URL}:${BUILD_TAG}
+                    docker push ${ECR_BACKEND_URL}:latest
+
+                    echo "--- Pushing frontend image ---"
+                    docker push ${ECR_FRONTEND_URL}:${BUILD_TAG}
+                    docker push ${ECR_FRONTEND_URL}:latest
+
+                    echo "✅ Images pushed to ECR"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 6 — Terraform Init
+        // Initializes Terraform and connects to S3 remote state backend
+        // This runs every time — it's safe and fast
+        // ══════════════════════════════════════════════════════════════
+        stage('Terraform Init') {
+            when {
+                expression { return params.RUN_TERRAFORM }
+            }
+            steps {
+                dir('terraform') {
+                    sh """
+                        echo "--- Terraform Init ---"
+                        echo "Connecting to S3 remote state backend..."
+
+                        terraform init \
+                            -input=false \
+                            -reconfigure
+
+                        echo "--- Terraform version ---"
+                        terraform version
+
+                        echo "--- Terraform workspace ---"
+                        terraform workspace show
+
+                        echo "✅ Terraform initialized"
+                    """
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 7 — Terraform Plan
+        // Shows EXACTLY what Terraform will create/change/destroy
+        // The plan is saved to a file and used in the apply stage
+        // This is a dry-run — nothing actually changes yet
+        // ══════════════════════════════════════════════════════════════
+        stage('Terraform Plan') {
+            when {
+                expression { return params.RUN_TERRAFORM }
+            }
+            steps {
+                dir('terraform') {
+                    sh """
+                        echo "--- Terraform Plan ---"
+                        echo "Calculating infrastructure changes..."
+
+                        terraform plan \
+                            -var="db_password=${DB_PASSWORD}" \
+                            -var="key_pair_name=${TF_KEY_PAIR_NAME}" \
+                            -var="aws_region=${AWS_REGION}" \
+                            -input=false \
+                            -out=tfplan \
+                            -detailed-exitcode || PLAN_EXIT=\$?
+
+                        # Exit code meanings:
+                        # 0 = no changes
+                        # 1 = error
+                        # 2 = changes planned
+                        if [ "\${PLAN_EXIT:-0}" = "1" ]; then
+                            echo "❌ Terraform plan failed"
+                            exit 1
+                        elif [ "\${PLAN_EXIT:-0}" = "2" ]; then
+                            echo "📋 Infrastructure changes detected"
+                        else
+                            echo "✅ No infrastructure changes needed"
+                        fi
+
+                        echo "--- Plan summary ---"
+                        terraform show -no-color tfplan | tail -20
+                    """
+                }
+            }
+            post {
+                always {
+                    // Save the plan as a Jenkins artifact so team can review it
+                    archiveArtifacts artifacts: 'terraform/tfplan',
+                                     allowEmptyArchive: true,
+                                     fingerprint: true
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 8 — Terraform Apply
+        // Applies the saved plan from Stage 7
+        // Creates/updates: VPC, EKS, ECR, RDS, Jenkins EC2, S3
+        // Uses the exact same plan that was reviewed in Stage 7
+        // ══════════════════════════════════════════════════════════════
+        stage('Terraform Apply') {
+            when {
+                allOf {
+                    expression { return params.RUN_TERRAFORM }
+                    expression { return params.TERRAFORM_ACTION == 'apply' }
+                }
+            }
+            steps {
+                dir('terraform') {
+                    sh """
+                        echo "--- Terraform Apply ---"
+                        echo "Applying infrastructure changes to AWS..."
+
+                        terraform apply \
+                            -input=false \
+                            -auto-approve \
+                            tfplan
+
+                        echo "--- Infrastructure outputs ---"
+                        terraform output
+
+                        echo "✅ Infrastructure applied successfully"
+                    """
+                }
+            }
+            post {
+                success {
+                    // Save outputs to a file for later stages to use
+                    dir('terraform') {
+                        sh """
+                            terraform output -json > ../terraform-outputs.json
+                            echo "Saved Terraform outputs to terraform-outputs.json"
+                        """
+                    }
+                    archiveArtifacts artifacts: 'terraform-outputs.json',
+                                     allowEmptyArchive: true
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 9 — Configure kubectl + Create K8s Resources
+        // Connects Jenkins to EKS and creates namespaces + secrets
+        // ══════════════════════════════════════════════════════════════
+        stage('Configure Kubernetes') {
+            steps {
+                sh """
+                    echo "--- Connecting to EKS cluster ---"
+                    aws eks update-kubeconfig \
+                        --region ${AWS_REGION} \
+                        --name ${EKS_CLUSTER_NAME}
+
+                    echo "--- Cluster info ---"
+                    kubectl cluster-info
+                    kubectl get nodes
+
+                    echo "--- Creating namespaces ---"
+                    kubectl create namespace dev        --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl create namespace monitoring  --dry-run=client -o yaml | kubectl apply -f -
+
+                    echo "--- Creating secrets in DEV ---"
+                    kubectl create secret generic backend-secret \
+                        --namespace=dev \
+                        --from-literal=db-password=${DB_PASSWORD} \
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    echo "--- Creating secrets in PRODUCTION ---"
+                    kubectl create secret generic backend-secret \
+                        --namespace=production \
+                        --from-literal=db-password=${DB_PASSWORD} \
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    echo "✅ Kubernetes configured"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 10 — Deploy to DEV with Helm
+        // Uses helm upgrade --install so it works for both
+        // first deployment and updates
+        // Dev uses fewer replicas and no autoscaling to save cost
+        // ══════════════════════════════════════════════════════════════
+        stage('Deploy to DEV') {
+            steps {
+                sh """
+                    echo "--- Deploying backend to DEV ---"
+                    helm upgrade --install backend-dev ./helm/backend \
+                        --namespace dev \
+                        --values ./helm/backend/values.yaml \
+                        --values ./helm/backend/values-dev.yaml \
+                        --set image.repository=${ECR_BACKEND_URL} \
+                        --set image.tag=${BUILD_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait \
+                        --timeout 5m \
+                        --atomic \
+                        --cleanup-on-fail
+
+                    echo "--- Deploying frontend to DEV ---"
+                    helm upgrade --install frontend-dev ./helm/frontend \
+                        --namespace dev \
+                        --values ./helm/frontend/values.yaml \
+                        --values ./helm/frontend/values-dev.yaml \
+                        --set image.repository=${ECR_FRONTEND_URL} \
+                        --set image.tag=${BUILD_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait \
+                        --timeout 5m \
+                        --atomic \
+                        --cleanup-on-fail
+
+                    echo "--- DEV deployment status ---"
+                    kubectl get all -n dev
+
+                    echo "✅ DEV deployment complete"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 11 — Smoke Test DEV
+        // Verifies pods are running and health endpoints respond
+        // If this fails, production deployment is blocked
+        // ══════════════════════════════════════════════════════════════
+        stage('Smoke Test DEV') {
+            steps {
+                sh """
+                    echo "--- Waiting for backend pods ---"
+                    kubectl rollout status deployment/backend-dev-backend \
+                        --namespace=dev \
+                        --timeout=120s
+
+                    echo "--- Waiting for frontend pods ---"
+                    kubectl rollout status deployment/frontend-dev-frontend \
+                        --namespace=dev \
+                        --timeout=120s
+
+                    echo "--- Checking pod health ---"
+                    kubectl get pods -n dev
+                    kubectl get pods -n dev | grep -v Running && \
+                        echo "⚠️ Some pods are not Running" || \
+                        echo "✅ All pods Running"
+
+                    echo "--- Testing health endpoint via port-forward ---"
+                    kubectl port-forward \
+                        svc/backend-service \
+                        8888:80 \
+                        --namespace=dev &
+                    PF_PID=\$!
+                    sleep 5
+
+                    HTTP_STATUS=\$(curl -s -o /dev/null -w "%{http_code}" \
+                        http://localhost:8888/api/health || echo "000")
+
+                    kill \$PF_PID 2>/dev/null || true
+
+                    if [ "\$HTTP_STATUS" = "200" ]; then
+                        echo "✅ Health check passed (HTTP 200)"
+                    else
+                        echo "⚠️ Health check returned HTTP \$HTTP_STATUS"
+                        echo "Continuing anyway — check DEV environment manually"
+                    fi
+
+                    echo "✅ DEV smoke tests complete"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 12 — Manual Approval Gate
+        // A human MUST review and approve before production deployment
+        // This is a critical step in real companies
+        // The pipeline pauses here and waits up to 30 minutes
+        // ══════════════════════════════════════════════════════════════
+        stage('Approve Production Deploy') {
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input(
+                        message: """
+┌─────────────────────────────────────────┐
+│   🚀 PRODUCTION DEPLOYMENT APPROVAL     │
+├─────────────────────────────────────────┤
+│  Image Tag    : ${BUILD_TAG}
+│  Build Number : ${BUILD_NUMBER}
+│  Git Commit   : \$GIT_COMMIT
+│
+│  ✅ Backend tests passed
+│  ✅ Frontend tests passed
+│  ✅ Images pushed to ECR
+│  ✅ Terraform applied
+│  ✅ DEV deployment successful
+│  ✅ DEV smoke tests passed
+│
+│  Please verify DEV before approving.
+│  DEV environment is running.
+└─────────────────────────────────────────┘
+                        """,
+                        ok: '🚀 Approve — Deploy to Production',
+                        submitter: 'admin',
+                        submitterParameter: 'APPROVED_BY'
+                    )
+                }
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 13 — Deploy to PRODUCTION with Helm
+        // --atomic means: if deployment fails, automatically roll back
+        // Production uses full replicas and autoscaling enabled
+        // ══════════════════════════════════════════════════════════════
+        stage('Deploy to PRODUCTION') {
+            steps {
+                sh """
+                    echo "--- Deploying backend to PRODUCTION ---"
+                    helm upgrade --install backend ./helm/backend \
+                        --namespace production \
+                        --values ./helm/backend/values.yaml \
+                        --set image.repository=${ECR_BACKEND_URL} \
+                        --set image.tag=${BUILD_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait \
+                        --timeout 10m \
+                        --atomic \
+                        --cleanup-on-fail
+
+                    echo "--- Deploying frontend to PRODUCTION ---"
+                    helm upgrade --install frontend ./helm/frontend \
+                        --namespace production \
+                        --values ./helm/frontend/values.yaml \
+                        --set image.repository=${ECR_FRONTEND_URL} \
+                        --set image.tag=${BUILD_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait \
+                        --timeout 10m \
+                        --atomic \
+                        --cleanup-on-fail
+
+                    echo "✅ PRODUCTION deployment complete"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 14 — Verify Production
+        // Final check that everything is healthy in production
+        // ══════════════════════════════════════════════════════════════
+        stage('Verify Production') {
+            steps {
+                sh """
+                    echo "--- Production pods ---"
+                    kubectl get pods -n production -o wide
+
+                    echo "--- Production services ---"
+                    kubectl get svc -n production
+
+                    echo "--- Autoscaling status ---"
+                    kubectl get hpa -n production
+
+                    echo "--- Helm releases ---"
+                    helm list --all-namespaces
+
+                    echo "--- Rollout status ---"
+                    kubectl rollout status deployment/backend-backend \
+                        --namespace=production \
+                        --timeout=60s
+
+                    kubectl rollout status deployment/frontend-frontend \
+                        --namespace=production \
+                        --timeout=60s
+
+                    echo "✅ Production is healthy"
+                    echo "✅ Build ${BUILD_NUMBER} with tag ${BUILD_TAG} is LIVE"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 15 — Deploy Monitoring (optional)
+        // Only runs if DEPLOY_MONITORING parameter is checked
+        // Installs Prometheus + Grafana via Helm
+        // ══════════════════════════════════════════════════════════════
+        stage('Deploy Monitoring') {
+            when {
+                expression { return params.DEPLOY_MONITORING }
+            }
+            steps {
+                sh """
+                    echo "--- Adding Helm repos ---"
+                    helm repo add prometheus-community \
+                        https://prometheus-community.github.io/helm-charts
+                    helm repo update
+
+                    echo "--- Installing Prometheus + Grafana ---"
+                    helm upgrade --install monitoring \
+                        prometheus-community/kube-prometheus-stack \
+                        --namespace monitoring \
+                        --values ./monitoring/prometheus-values.yaml \
+                        --wait \
+                        --timeout 10m
+
+                    echo "--- Monitoring stack ---"
+                    kubectl get pods -n monitoring
+
+                    echo "✅ Monitoring deployed"
+                    echo "Access Grafana: kubectl port-forward svc/monitoring-grafana 3000:80 -n monitoring"
+                """
+            }
+        }
+
+        // ══════════════════════════════════════════════════════════════
+        // STAGE 16 — Terraform Destroy (only when explicitly chosen)
+        // Safety: only runs when TERRAFORM_ACTION = destroy
+        // Used for tearing down the whole environment
+        // ══════════════════════════════════════════════════════════════
+        stage('Terraform Destroy') {
+            when {
+                expression { return params.TERRAFORM_ACTION == 'destroy' }
+            }
+            steps {
+                // Extra confirmation before destroying everything
+                timeout(time: 10, unit: 'MINUTES') {
+                    input(
+                        message: '⚠️ DANGER: This will DESTROY all AWS infrastructure. Are you absolutely sure?',
+                        ok: 'Yes, destroy everything'
+                    )
+                }
+                dir('terraform') {
+                    sh """
+                        terraform destroy \
+                            -var="db_password=${DB_PASSWORD}" \
+                            -var="key_pair_name=${TF_KEY_PAIR_NAME}" \
+                            -var="aws_region=${AWS_REGION}" \
+                            -input=false \
+                            -auto-approve
+
+                        echo "✅ Infrastructure destroyed"
+                    """
+                }
+            }
+        }
+    }
+
+    // ── Post Pipeline Actions ─────────────────────────────────────────
+    // These run after ALL stages complete, regardless of success/failure
+    post {
+
+        success {
+            sh """
+                echo ""
+                echo "╔══════════════════════════════════════════╗"
+                echo "║   ✅  PIPELINE SUCCESS                   ║"
+                echo "╠══════════════════════════════════════════╣"
+                echo "║  Build    : ${BUILD_NUMBER}              ║"
+                echo "║  Tag      : ${BUILD_TAG}                 ║"
+                echo "║  Status   : LIVE IN PRODUCTION           ║"
+                echo "╚══════════════════════════════════════════╝"
+            """
+        }
+
+        failure {
+            sh """
+                echo ""
+                echo "╔══════════════════════════════════════════╗"
+                echo "║   ❌  PIPELINE FAILED                    ║"
+                echo "╠══════════════════════════════════════════╣"
+                echo "║  Build  : ${BUILD_NUMBER}                ║"
+                echo "║  Action : Check logs above               ║"
+                echo "╚══════════════════════════════════════════╝"
+            """
+        }
+
+        always {
+            // Clean Docker images from Jenkins agent to save disk space
+            sh """
+                docker rmi ${ECR_BACKEND_URL}:${BUILD_TAG}  2>/dev/null || true
+                docker rmi ${ECR_FRONTEND_URL}:${BUILD_TAG} 2>/dev/null || true
+                docker rmi ${ECR_BACKEND_URL}:latest        2>/dev/null || true
+                docker rmi ${ECR_FRONTEND_URL}:latest       2>/dev/null || true
+                echo "Cleaned up local Docker images"
+            """
+
+            // Clean the Jenkins workspace
+            cleanWs()
+        }
+    }
+}

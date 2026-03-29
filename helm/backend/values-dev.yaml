@@ -1,0 +1,19 @@
+# ── DEV environment overrides ────────────────────────────────────────
+# These values override values.yaml for dev namespace only
+
+replicaCount: 1        # Save cost in dev — only 1 pod
+
+autoscaling:
+  enabled: false       # No autoscaling in dev
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+env:
+  ENV: development
+  APP_VERSION: "dev"
