@@ -186,12 +186,12 @@ pipeline {
             post {
 
                 always {
-                    node{
+                    
                          // Save plan as artifact so team can review
                     archiveArtifacts artifacts: "${TF_DIR}/tfplan",
                                      allowEmptyArchive: true,
                                      fingerprint: true
-                    }
+                    
                    
                 }
             }
