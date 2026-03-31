@@ -11,11 +11,12 @@ terraform {
   # Remote state stored in S3 — shared across Jenkins runs
   # DynamoDB prevents two pipeline runs applying at same time
   backend "s3" {
-    bucket         = "devops-platform-tfstate-YOURNAME"   # ← change this
+    bucket         = "devops-platform-tfstate-amira"   # ← change this
     key            = "production/terraform.tfstate"
     region         = "us-east-1"
     encrypt        = true
-    dynamodb_table = "terraform-state-locks"
+    use_lockfile = true
+
   }
 }
 
