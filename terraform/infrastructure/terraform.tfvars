@@ -26,3 +26,5 @@ eks_cluster_version = "1.29"
 
 
 key_pair_name = "devops-key"
+
+db_password = "12345"

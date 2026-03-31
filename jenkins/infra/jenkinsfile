@@ -389,9 +389,11 @@ pipeline {
             echo "❌ Infrastructure pipeline FAILED — check logs above"
             echo "   Terraform state may be locked — check DynamoDB if needed"
         }
-
-        always {
-            cleanWs()
+        node{
+            always {
+                cleanWs()
+            } 
         }
+       
     }
 }
