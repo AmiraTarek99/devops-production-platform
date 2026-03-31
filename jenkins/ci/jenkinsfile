@@ -1,0 +1,348 @@
+// ═══════════════════════════════════════════════════════════════════
+//  PIPELINE 1 — CI (Continuous Integration)
+//
+//  Triggered by: GitHub webhook on every push to main branch
+//  Does NOT deploy anything — only tests and builds
+//
+//  Stages:
+//    1. Checkout         → pull latest code from GitHub
+//    2. Test Backend     → pytest + flake8
+//    3. Test Frontend    → npm test
+//    4. Build Images     → docker build backend + frontend
+//    5. Security Scan    → scan images for vulnerabilities
+//    6. Push to ECR      → push both images to AWS ECR
+//    7. Trigger Deploy   → automatically trigger deploy pipeline
+//
+//  On success:
+//    - Saves IMAGE_TAG as artifact for deploy pipeline to read
+//    - Triggers Pipeline 3 (deploy) automatically
+//
+//  On failure:
+//    - Stops immediately
+//    - Nothing gets deployed
+//    - Team gets notified
+// ═══════════════════════════════════════════════════════════════════
+
+pipeline {
+
+    agent any
+
+    // ── Triggered automatically by GitHub webhook ──────────────────
+    triggers {
+        githubPush()    // fires when GitHub sends a push webhook
+    }
+
+    environment {
+        AWS_REGION       = 'us-east-1'
+        ECR_BACKEND_URL  = credentials('ECR_BACKEND_URL')
+        ECR_FRONTEND_URL = credentials('ECR_FRONTEND_URL')
+
+        // Image tag = short git SHA (7 chars)
+        // Example: abc1234
+        // This makes every image uniquely traceable to a commit
+        IMAGE_TAG = "${GIT_COMMIT[0..6]}"
+    }
+
+    options {
+        // Keep last 20 builds
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+
+        // Fail if CI takes more than 30 minutes
+        timeout(time: 30, unit: 'MINUTES')
+
+        timestamps()
+        ansiColor('xterm')
+
+        // Allow concurrent CI builds
+        // Two developers can push at the same time
+        // Each gets their own build
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 1 — Checkout
+        // ─────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                sh """
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  CI Pipeline — Build #${BUILD_NUMBER}"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  Branch  : \$GIT_BRANCH"
+                    echo "  Commit  : \$GIT_COMMIT"
+                    echo "  Tag     : ${IMAGE_TAG}"
+                    echo "  Author  : \$GIT_AUTHOR_NAME"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 2 — Test Backend
+        //
+        // Runs two checks:
+        //   flake8 → checks code style and formatting
+        //   pytest → runs unit tests
+        //
+        // If either fails → pipeline stops → nothing gets built
+        // This protects production from broken code
+        // ─────────────────────────────────────────────────────────────
+        stage('Test Backend') {
+            steps {
+                dir('backend') {
+                    sh """
+                        echo "--- Setting up Python virtualenv ---"
+                        python3 -m venv venv
+                        . venv/bin/activate
+
+                        echo "--- Installing dependencies ---"
+                        pip install -r requirements.txt --quiet
+
+                        echo "--- Running code linter (flake8) ---"
+                        flake8 . \
+                            --max-line-length=100 \
+                            --exclude=venv,__pycache__ \
+                            --format='%(path)s:%(row)d: %(text)s'
+
+                        echo "--- Running unit tests (pytest) ---"
+                        pytest test_app.py \
+                            -v \
+                            --tb=short \
+                            --junit-xml=test-results.xml \
+                            --cov=. \
+                            --cov-report=xml:coverage.xml
+
+                        echo "✅ Backend tests passed"
+                    """
+                }
+            }
+            post {
+                always {
+                    // Show test results in Jenkins UI
+                    junit allowEmptyResults: true,
+                          testResults: 'backend/test-results.xml'
+
+                    // Clean up
+                    sh 'rm -rf backend/venv'
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 3 — Test Frontend
+        // ─────────────────────────────────────────────────────────────
+        stage('Test Frontend') {
+            steps {
+                dir('frontend') {
+                    sh """
+                        echo "--- Installing npm packages ---"
+                        npm ci --silent
+
+                        echo "--- Running frontend tests ---"
+                        CI=true npm test -- \
+                            --watchAll=false \
+                            --passWithNoTests \
+                            --reporters=default
+
+                        echo "✅ Frontend tests passed"
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 4 — Build Docker Images
+        //
+        // Builds two images:
+        //   backend  → Python Flask API
+        //   frontend → React app served by Nginx
+        //
+        // Each image gets TWO tags:
+        //   :abc1234  → specific version tag (git SHA)
+        //   :latest   → always points to newest image
+        //
+        // Why two tags?
+        //   - Specific tag for rollbacks ("give me exactly build abc1234")
+        //   - Latest for convenience ("give me the newest")
+        // ─────────────────────────────────────────────────────────────
+        stage('Build Docker Images') {
+            steps {
+                sh """
+                    echo "--- Building backend image ---"
+                    docker build \
+                        --tag  ${ECR_BACKEND_URL}:${IMAGE_TAG} \
+                        --tag  ${ECR_BACKEND_URL}:latest \
+                        --label "git-commit=\$GIT_COMMIT" \
+                        --label "git-branch=\$GIT_BRANCH" \
+                        --label "build-number=${BUILD_NUMBER}" \
+                        --label "build-date=\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        --file backend/Dockerfile \
+                        ./backend
+
+                    echo "--- Building frontend image ---"
+                    docker build \
+                        --tag  ${ECR_FRONTEND_URL}:${IMAGE_TAG} \
+                        --tag  ${ECR_FRONTEND_URL}:latest \
+                        --label "git-commit=\$GIT_COMMIT" \
+                        --label "git-branch=\$GIT_BRANCH" \
+                        --label "build-number=${BUILD_NUMBER}" \
+                        --label "build-date=\$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        --file frontend/Dockerfile \
+                        ./frontend
+
+                    echo "--- Built images ---"
+                    docker images | grep -E "devops-platform"
+
+                    echo "✅ Images built successfully"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 5 — Security Scan
+        //
+        // Scans Docker images for known vulnerabilities
+        // Uses Trivy — industry standard open source scanner
+        //
+        // exit-code=0 means: report vulnerabilities but don't fail
+        // Change to exit-code=1 to enforce security gate
+        // ─────────────────────────────────────────────────────────────
+        stage('Security Scan') {
+            steps {
+                sh """
+                    # Install trivy if not present
+                    if ! command -v trivy &> /dev/null; then
+                        echo "Installing Trivy..."
+                        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+                    fi
+
+                    echo "--- Scanning backend image ---"
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        ${ECR_BACKEND_URL}:${IMAGE_TAG}
+
+                    echo "--- Scanning frontend image ---"
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        ${ECR_FRONTEND_URL}:${IMAGE_TAG}
+
+                    echo "✅ Security scan complete"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 6 — Push to ECR
+        //
+        // Authenticates with AWS ECR using IAM role (no password)
+        // Pushes both images with both tags
+        // ─────────────────────────────────────────────────────────────
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    echo "--- Authenticating with ECR ---"
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                        docker login \
+                            --username AWS \
+                            --password-stdin ${ECR_BACKEND_URL}
+
+                    echo "--- Pushing backend image ---"
+                    docker push ${ECR_BACKEND_URL}:${IMAGE_TAG}
+                    docker push ${ECR_BACKEND_URL}:latest
+
+                    echo "--- Pushing frontend image ---"
+                    docker push ${ECR_FRONTEND_URL}:${IMAGE_TAG}
+                    docker push ${ECR_FRONTEND_URL}:latest
+
+                    echo "✅ Images pushed to ECR successfully"
+                    echo "   Backend  : ${ECR_BACKEND_URL}:${IMAGE_TAG}"
+                    echo "   Frontend : ${ECR_FRONTEND_URL}:${IMAGE_TAG}"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 7 — Save Artifacts and Trigger Deploy
+        //
+        // Saves the IMAGE_TAG so deploy pipeline knows which
+        // image version to deploy
+        //
+        // Then triggers Pipeline 3 (deploy) automatically
+        // passing the image tag as a parameter
+        // ─────────────────────────────────────────────────────────────
+        stage('Trigger Deploy Pipeline') {
+            steps {
+                sh """
+                    # Save image tag to file — deploy pipeline reads this
+                    echo "${IMAGE_TAG}" > image-tag.txt
+                    echo "Image tag saved: ${IMAGE_TAG}"
+                """
+
+                // Save the image tag file as a Jenkins artifact
+                // Deploy pipeline can copy it from here
+                archiveArtifacts artifacts: 'image-tag.txt',
+                                 fingerprint: true
+
+                // Trigger the deploy pipeline automatically
+                // passing the image tag that was just built and pushed
+                build job: 'devops-platform-deploy',
+                      wait: false,    // don't wait for deploy to finish
+                      parameters: [
+                          string(name: 'IMAGE_TAG',   value: IMAGE_TAG),
+                          string(name: 'GIT_COMMIT',  value: GIT_COMMIT),
+                          string(name: 'GIT_BRANCH',  value: GIT_BRANCH),
+                          string(name: 'CI_BUILD_NUM', value: BUILD_NUMBER)
+                      ]
+
+                echo "✅ Deploy pipeline triggered with tag: ${IMAGE_TAG}"
+            }
+        }
+    }
+
+    // ── Post actions ───────────────────────────────────────────────
+    post {
+        success {
+            echo """
+            ╔══════════════════════════════════════╗
+            ║   ✅ CI PIPELINE SUCCESS             ║
+            ╠══════════════════════════════════════╣
+            ║  Build   : ${BUILD_NUMBER}           ║
+            ║  Tag     : ${IMAGE_TAG}              ║
+            ║  Images  : pushed to ECR             ║
+            ║  Deploy  : triggered automatically   ║
+            ╚══════════════════════════════════════╝
+            """
+        }
+
+        failure {
+            echo """
+            ╔══════════════════════════════════════╗
+            ║   ❌ CI PIPELINE FAILED              ║
+            ╠══════════════════════════════════════╣
+            ║  Build  : ${BUILD_NUMBER}            ║
+            ║  Action : fix the error above        ║
+            ║  Deploy : NOT triggered              ║
+            ╚══════════════════════════════════════╝
+            """
+        }
+
+        always {
+            // Clean local Docker images to save disk space
+            sh """
+                docker rmi ${ECR_BACKEND_URL}:${IMAGE_TAG}  2>/dev/null || true
+                docker rmi ${ECR_FRONTEND_URL}:${IMAGE_TAG} 2>/dev/null || true
+                docker rmi ${ECR_BACKEND_URL}:latest        2>/dev/null || true
+                docker rmi ${ECR_FRONTEND_URL}:latest       2>/dev/null || true
+                echo "Local Docker images cleaned"
+            """
+            cleanWs()
+        }
+    }
+}

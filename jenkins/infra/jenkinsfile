@@ -1,0 +1,393 @@
+// ═══════════════════════════════════════════════════════════════════
+//  PIPELINE 2 — INFRASTRUCTURE
+//
+//  Triggered by: MANUAL ONLY — a DevOps engineer runs this
+//  Never triggered automatically — infrastructure changes
+//  must always be reviewed by a human first
+//
+//  Has two action buttons:
+//    APPLY   → creates/updates all AWS infrastructure
+//    DESTROY → destroys all AWS infrastructure (with confirmation)
+//
+//  Stages:
+//    1. Checkout          → pull latest terraform code
+//    2. Terraform Init    → connect to S3 backend
+//    3. Terraform Plan    → calculate what will change
+//    4. Show Plan         → display plan clearly in Jenkins UI
+//    5. Approval Gate     → human reviews plan and approves
+//    6. Terraform Apply   → create/update infrastructure
+//         OR
+//       Terraform Destroy → destroy all infrastructure
+//
+//  What it creates (Apply):
+//    VPC, public/private subnets, NAT Gateway
+//    EKS cluster + managed node groups + addons
+//    ECR repositories (backend + frontend)
+//    RDS PostgreSQL database
+//    S3 bucket for app storage
+//
+//  NOTE: Jenkins EC2 itself is NOT created here
+//  Jenkins EC2 is created by bootstrap/main.tf run manually once
+//  This pipeline only manages application infrastructure
+// ═══════════════════════════════════════════════════════════════════
+
+pipeline {
+
+    agent any
+
+    // ── Parameters — shown as buttons/fields in Jenkins UI ─────────
+    parameters {
+
+        // ── ACTION BUTTON ──────────────────────────────────────────
+        // This is the main button that controls what Terraform does
+        // Shows as a dropdown in Jenkins UI
+        choice(
+            name:        'ACTION',
+            choices:     ['Apply', 'Destroy'],
+            description: '''
+            ┌─────────────────────────────────────────┐
+            │  Apply   → Create/update infrastructure  │
+            │  Destroy → Destroy all infrastructure    │
+            └─────────────────────────────────────────┘
+            Choose Apply for normal deployments.
+            Choose Destroy only when tearing down environment.
+            '''
+        )
+
+        // ── ENVIRONMENT ────────────────────────────────────────────
+        choice(
+            name:        'ENVIRONMENT',
+            choices:     ['production', 'staging', 'development'],
+            description: 'Which environment to provision'
+        )
+
+        // ── SKIP PLAN REVIEW ───────────────────────────────────────
+        booleanParam(
+            name:         'AUTO_APPROVE_PLAN',
+            defaultValue: false,
+            description:  'Skip plan review and apply immediately (NOT recommended for production)'
+        )
+    }
+
+    environment {
+        AWS_REGION  = 'us-east-1'
+        DB_PASSWORD = credentials('DB_PASSWORD')
+        TF_DIR      = 'terraform/infrastructure'
+
+        // Terraform log level — set to DEBUG for troubleshooting
+        TF_LOG = 'INFO'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 90, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+
+        // CRITICAL — only one infra pipeline can run at a time
+        // Two simultaneous terraform applies would corrupt state
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 1 — Checkout
+        // Pull latest Terraform code from GitHub
+        // ─────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                sh """
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  Infrastructure Pipeline — Build #${BUILD_NUMBER}"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  Action      : ${params.ACTION}"
+                    echo "  Environment : ${params.ENVIRONMENT}"
+                    echo "  Branch      : \$GIT_BRANCH"
+                    echo "  Commit      : \$GIT_COMMIT"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 2 — Terraform Init
+        //
+        // Downloads AWS provider plugin
+        // Connects to S3 backend and reads existing state
+        // Must run every pipeline execution — it is fast and safe
+        // ─────────────────────────────────────────────────────────────
+        stage('Terraform Init') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        echo "--- Terraform Init ---"
+                        echo "Connecting to S3 state backend..."
+
+                        terraform init \
+                            -input=false \
+                            -reconfigure
+
+                        echo "--- Terraform version ---"
+                        terraform version
+
+                        echo "--- Current workspace ---"
+                        terraform workspace show
+
+                        echo "✅ Terraform initialized"
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 3 — Terraform Plan
+        //
+        // Calculates EXACTLY what will be created/changed/destroyed
+        // Nothing is changed in AWS during this stage
+        // Plan is saved to tfplan file
+        //
+        // Exit codes:
+        //   0 = no changes needed
+        //   1 = error in configuration
+        //   2 = changes are planned
+        // ─────────────────────────────────────────────────────────────
+        stage('Terraform Plan') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        echo "--- Terraform Plan (${params.ACTION}) ---"
+
+                        ${params.ACTION == 'Destroy' ? '''
+                        # Plan what would be destroyed
+                        terraform plan \
+                            -destroy \
+                            -var="db_password=${DB_PASSWORD}" \
+                            -var="environment=${params.ENVIRONMENT}" \
+                            -var="aws_region=${AWS_REGION}" \
+                            -input=false \
+                            -out=tfplan
+                        ''' : '''
+                        # Plan what would be created/updated
+                        terraform plan \
+                            -var="db_password=${DB_PASSWORD}" \
+                            -var="environment=${params.ENVIRONMENT}" \
+                            -var="aws_region=${AWS_REGION}" \
+                            -input=false \
+                            -out=tfplan
+                        '''}
+
+                        echo "✅ Plan complete"
+                    """
+                }
+            }
+            post {
+                always {
+                    // Save plan as artifact so team can review
+                    archiveArtifacts artifacts: "${TF_DIR}/tfplan",
+                                     allowEmptyArchive: true,
+                                     fingerprint: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 4 — Show Plan
+        //
+        // Displays the plan in human-readable format
+        // Team reviews this before approving
+        // ─────────────────────────────────────────────────────────────
+        stage('Show Plan') {
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  TERRAFORM PLAN SUMMARY"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        # Show full plan in readable format
+                        terraform show -no-color tfplan
+
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  Review the plan above carefully"
+                        echo "  before approving in the next stage"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    """
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 5 — Approval Gate
+        //
+        // Pipeline PAUSES here and waits for human approval
+        // Team reviews the plan from Stage 4 then clicks approve
+        //
+        // For Apply → approve to create/update resources
+        // For Destroy → approve to delete everything (DANGEROUS)
+        //
+        // Skipped if AUTO_APPROVE_PLAN is checked (not recommended)
+        // ─────────────────────────────────────────────────────────────
+        stage('Approval Gate') {
+            when {
+                expression { return !params.AUTO_APPROVE_PLAN }
+            }
+            steps {
+                script {
+                    def actionEmoji = params.ACTION == 'Destroy' ? '⚠️  DESTROY' : '✅ APPLY'
+                    def actionWarning = params.ACTION == 'Destroy' ?
+                        'THIS WILL DELETE ALL INFRASTRUCTURE. DATA WILL BE LOST.' :
+                        'This will create/update AWS infrastructure.'
+
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  ${actionEmoji} Infrastructure Change Approval
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Action      : ${params.ACTION}
+  Environment : ${params.ENVIRONMENT}
+  Build       : #${BUILD_NUMBER}
+
+  ${actionWarning}
+
+  Review the plan in Stage 4 above.
+  Approve only if the plan looks correct.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                            """,
+                            ok: "Confirm ${params.ACTION}",
+                            submitter: 'admin,devops-team'
+                        )
+                    }
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 6A — Terraform Apply
+        //
+        // Creates or updates all AWS infrastructure:
+        //   - VPC with public and private subnets
+        //   - NAT Gateway for private subnet internet access
+        //   - EKS cluster + managed node group + addons
+        //   - ECR repositories for Docker images
+        //   - RDS PostgreSQL database
+        //   - S3 bucket
+        //
+        // Uses the exact plan saved in Stage 3
+        // State is saved to S3 after apply
+        //
+        // EKS creation takes 15-20 minutes — this is normal
+        // ─────────────────────────────────────────────────────────────
+        stage('Terraform Apply') {
+            when {
+                expression { return params.ACTION == 'Apply' }
+            }
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  TERRAFORM APPLY STARTING"
+                        echo "  Creating AWS infrastructure..."
+                        echo "  EKS creation takes 15-20 minutes"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        terraform apply \
+                            -input=false \
+                            -auto-approve \
+                            tfplan
+
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  INFRASTRUCTURE OUTPUTS"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        terraform output
+
+                        echo "✅ Infrastructure created/updated successfully"
+                    """
+                }
+            }
+            post {
+                success {
+                    dir("${TF_DIR}") {
+                        sh """
+                            # Save outputs so other pipelines can read them
+                            terraform output -json > ../../terraform-outputs.json
+                            echo "Outputs saved to terraform-outputs.json"
+
+                            # Extract key values for easy access
+                            terraform output -raw eks_cluster_name > ../../eks-cluster-name.txt
+                            terraform output -raw ecr_backend_url  > ../../ecr-backend-url.txt
+                            terraform output -raw ecr_frontend_url > ../../ecr-frontend-url.txt
+                        """
+                    }
+                    archiveArtifacts artifacts: 'terraform-outputs.json,eks-cluster-name.txt,ecr-backend-url.txt,ecr-frontend-url.txt',
+                                     allowEmptyArchive: true,
+                                     fingerprint: true
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 6B — Terraform Destroy
+        //
+        // DESTROYS all AWS infrastructure
+        // This is IRREVERSIBLE — data in RDS will be lost
+        //
+        // Only runs when ACTION = Destroy
+        // Already approved in Stage 5
+        //
+        // Use this when:
+        //   - Tearing down environment to save costs
+        //   - Starting fresh after a major change
+        //   - End of project cleanup
+        // ─────────────────────────────────────────────────────────────
+        stage('Terraform Destroy') {
+            when {
+                expression { return params.ACTION == 'Destroy' }
+            }
+            steps {
+                dir("${TF_DIR}") {
+                    sh """
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                        echo "  ⚠️  TERRAFORM DESTROY STARTING"
+                        echo "  Deleting all AWS infrastructure..."
+                        echo "  This cannot be undone"
+                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                        terraform apply \
+                            -input=false \
+                            -auto-approve \
+                            tfplan
+
+                        echo "✅ All infrastructure destroyed"
+                        echo "  VPC, EKS, RDS, ECR, S3 — all deleted"
+                    """
+                }
+            }
+        }
+    }
+
+    // ── Post actions ───────────────────────────────────────────────
+    post {
+        success {
+            script {
+                if (params.ACTION == 'Apply') {
+                    echo "✅ Infrastructure APPLY successful — environment is ready"
+                } else {
+                    echo "✅ Infrastructure DESTROY successful — all resources deleted"
+                }
+            }
+        }
+
+        failure {
+            echo "❌ Infrastructure pipeline FAILED — check logs above"
+            echo "   Terraform state may be locked — check DynamoDB if needed"
+        }
+
+        always {
+            cleanWs()
+        }
+    }
+}

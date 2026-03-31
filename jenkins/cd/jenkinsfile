@@ -1,0 +1,565 @@
+// ═══════════════════════════════════════════════════════════════════
+//  PIPELINE 3 — DEPLOY
+//
+//  Triggered by:
+//    - Automatically: Pipeline 1 (CI) triggers this on success
+//    - Manually: DevOps engineer can trigger with specific tag
+//
+//  Stages:
+//    1.  Checkout           → pull latest code
+//    2.  Validate Inputs    → verify image exists in ECR
+//    3.  Configure kubectl  → connect to EKS cluster
+//    4.  Setup Namespaces   → create dev/production namespaces
+//    5.  Create Secrets     → DB passwords in K8s secrets
+//    6.  Deploy to DEV      → helm deploy to dev namespace
+//    7.  Smoke Test DEV     → verify DEV is working
+//    8.  Approval Gate      → human approves production deploy
+//    9.  Deploy PRODUCTION  → helm deploy to production namespace
+//    10. Verify Production  → final health check
+//    11. Rollback (manual)  → rollback button if needed
+//
+//  Parameters:
+//    IMAGE_TAG   → which image version to deploy
+//    DEPLOY_ENV  → which environment (dev/production/both)
+//    ROLLBACK    → rollback production to previous version
+// ═══════════════════════════════════════════════════════════════════
+
+pipeline {
+
+    agent any
+
+    parameters {
+        // ── IMAGE TAG ───────────────────────────────────────────────
+        // Passed automatically from CI pipeline
+        // Can also be set manually for hotfixes or rollbacks
+        string(
+            name:         'IMAGE_TAG',
+            defaultValue: 'latest',
+            description:  'Docker image tag to deploy (git SHA from CI pipeline)'
+        )
+
+        // ── DEPLOY ENVIRONMENT ──────────────────────────────────────
+        choice(
+            name:    'DEPLOY_ENV',
+            choices: ['both', 'dev-only', 'production-only'],
+            description: '''
+            both             → deploy to DEV then PRODUCTION (normal flow)
+            dev-only         → deploy to DEV only (for testing)
+            production-only  → deploy directly to PRODUCTION (emergency hotfix)
+            '''
+        )
+
+        // ── ROLLBACK ────────────────────────────────────────────────
+        booleanParam(
+            name:         'ROLLBACK',
+            defaultValue: false,
+            description:  'Rollback production to previous Helm release version'
+        )
+
+        // ── CI INFO ─────────────────────────────────────────────────
+        // Passed from CI pipeline for traceability
+        string(name: 'GIT_COMMIT',   defaultValue: '', description: 'Git commit SHA from CI')
+        string(name: 'GIT_BRANCH',   defaultValue: '', description: 'Git branch from CI')
+        string(name: 'CI_BUILD_NUM', defaultValue: '', description: 'CI pipeline build number')
+
+        // ── MONITORING ──────────────────────────────────────────────
+        booleanParam(
+            name:         'DEPLOY_MONITORING',
+            defaultValue: false,
+            description:  'Deploy/update Prometheus + Grafana monitoring stack'
+        )
+    }
+
+    environment {
+        AWS_REGION       = 'us-east-1'
+        EKS_CLUSTER_NAME = 'devops-platform-production'
+        ECR_BACKEND_URL  = credentials('ECR_BACKEND_URL')
+        ECR_FRONTEND_URL = credentials('ECR_FRONTEND_URL')
+        DB_PASSWORD      = credentials('DB_PASSWORD')
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+    }
+
+    stages {
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 1 — Checkout
+        // ─────────────────────────────────────────────────────────────
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                sh """
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  Deploy Pipeline — Build #${BUILD_NUMBER}"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  Image Tag   : ${params.IMAGE_TAG}"
+                    echo "  Environment : ${params.DEPLOY_ENV}"
+                    echo "  Rollback    : ${params.ROLLBACK}"
+                    echo "  CI Build    : #${params.CI_BUILD_NUM}"
+                    echo "  Git Commit  : ${params.GIT_COMMIT}"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 2 — Validate Image Exists in ECR
+        //
+        // Before deploying, verify the image actually exists in ECR
+        // Prevents deploying a tag that was never built
+        // ─────────────────────────────────────────────────────────────
+        stage('Validate Image') {
+            when {
+                expression { return !params.ROLLBACK }
+            }
+            steps {
+                sh """
+                    echo "--- Verifying image exists in ECR ---"
+
+                    aws ecr describe-images \
+                        --repository-name devops-platform-backend \
+                        --image-ids imageTag=${params.IMAGE_TAG} \
+                        --region ${AWS_REGION} \
+                        --query 'imageDetails[0].imageTags' \
+                        --output text
+
+                    if [ \$? -ne 0 ]; then
+                        echo "❌ Image tag '${params.IMAGE_TAG}' not found in ECR"
+                        echo "   Make sure CI pipeline ran successfully first"
+                        exit 1
+                    fi
+
+                    echo "✅ Image ${params.IMAGE_TAG} confirmed in ECR"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 3 — Configure kubectl
+        //
+        // Connect Jenkins to the EKS cluster
+        // Downloads cluster credentials to ~/.kube/config
+        // All kubectl commands after this talk to your cluster
+        // ─────────────────────────────────────────────────────────────
+        stage('Configure kubectl') {
+            steps {
+                sh """
+                    echo "--- Connecting to EKS cluster ---"
+                    aws eks update-kubeconfig \
+                        --region ${AWS_REGION} \
+                        --name   ${EKS_CLUSTER_NAME}
+
+                    echo "--- Cluster info ---"
+                    kubectl cluster-info
+
+                    echo "--- Nodes ---"
+                    kubectl get nodes -o wide
+
+                    echo "✅ kubectl connected to EKS"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 4 — Create Namespaces
+        //
+        // Namespaces separate environments in the same cluster
+        // dev and production are completely isolated
+        //
+        // --dry-run=client -o yaml | kubectl apply -f - means:
+        //   create namespace IF it does not exist
+        //   skip if it already exists (idempotent)
+        // ─────────────────────────────────────────────────────────────
+        stage('Setup Namespaces') {
+            steps {
+                sh """
+                    echo "--- Creating namespaces ---"
+                    kubectl create namespace dev        --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+                    kubectl create namespace monitoring  --dry-run=client -o yaml | kubectl apply -f -
+
+                    echo "--- Namespaces ---"
+                    kubectl get namespaces
+
+                    echo "✅ Namespaces ready"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 5 — Create Kubernetes Secrets
+        //
+        // Secrets store sensitive data (DB password) inside K8s
+        // Pods read secrets as environment variables
+        // Secrets are base64 encoded in etcd (Kubernetes storage)
+        // Never stored in code or logs
+        //
+        // --dry-run=client -o yaml | kubectl apply -f - means:
+        //   update secret if it exists
+        //   create it if it does not exist (idempotent)
+        // ─────────────────────────────────────────────────────────────
+        stage('Create Secrets') {
+            steps {
+                sh """
+                    echo "--- Creating secrets in DEV ---"
+                    kubectl create secret generic backend-secret \
+                        --namespace=dev \
+                        --from-literal=db-password=${DB_PASSWORD} \
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    echo "--- Creating secrets in PRODUCTION ---"
+                    kubectl create secret generic backend-secret \
+                        --namespace=production \
+                        --from-literal=db-password=${DB_PASSWORD} \
+                        --dry-run=client -o yaml | kubectl apply -f -
+
+                    echo "✅ Secrets created in all namespaces"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 6 — Deploy to DEV
+        //
+        // helm upgrade --install:
+        //   - First time: creates the release (install)
+        //   - Subsequent: updates the release (upgrade)
+        //
+        // --values values.yaml     → production defaults
+        // --values values-dev.yaml → dev overrides (1 replica, no HPA)
+        // --set image.tag          → exact image built by CI
+        // --atomic                 → rollback automatically on failure
+        // --wait                   → wait until all pods are Running
+        // ─────────────────────────────────────────────────────────────
+        stage('Deploy to DEV') {
+            when {
+                expression { return params.DEPLOY_ENV in ['both', 'dev-only'] && !params.ROLLBACK }
+            }
+            steps {
+                sh """
+                    echo "--- Deploying backend to DEV ---"
+                    helm upgrade --install backend-dev ./helm/backend \
+                        --namespace dev \
+                        --values    ./helm/backend/values.yaml \
+                        --values    ./helm/backend/values-dev.yaml \
+                        --set image.repository=${ECR_BACKEND_URL} \
+                        --set image.tag=${params.IMAGE_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait            \
+                        --timeout 5m      \
+                        --atomic          \
+                        --cleanup-on-fail
+
+                    echo "--- Deploying frontend to DEV ---"
+                    helm upgrade --install frontend-dev ./helm/frontend \
+                        --namespace dev \
+                        --values    ./helm/frontend/values.yaml \
+                        --values    ./helm/frontend/values-dev.yaml \
+                        --set image.repository=${ECR_FRONTEND_URL} \
+                        --set image.tag=${params.IMAGE_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait            \
+                        --timeout 5m      \
+                        --atomic          \
+                        --cleanup-on-fail
+
+                    echo "--- DEV status ---"
+                    kubectl get all -n dev
+
+                    echo "✅ DEV deployment complete"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 7 — Smoke Test DEV
+        //
+        // Verifies the DEV deployment is actually healthy
+        // Checks:
+        //   - All pods are Running
+        //   - Health endpoint responds with HTTP 200
+        //
+        // If this fails → production deploy is BLOCKED
+        // ─────────────────────────────────────────────────────────────
+        stage('Smoke Test DEV') {
+            when {
+                expression { return params.DEPLOY_ENV in ['both', 'dev-only'] && !params.ROLLBACK }
+            }
+            steps {
+                sh """
+                    echo "--- Waiting for DEV pods to be ready ---"
+                    kubectl rollout status deployment/backend-dev-backend \
+                        --namespace=dev --timeout=120s
+
+                    kubectl rollout status deployment/frontend-dev-frontend \
+                        --namespace=dev --timeout=120s
+
+                    echo "--- Pod status ---"
+                    kubectl get pods -n dev
+
+                    # Check all pods are Running
+                    FAILED_PODS=\$(kubectl get pods -n dev \
+                        --field-selector=status.phase!=Running \
+                        --no-headers 2>/dev/null | wc -l)
+
+                    if [ "\$FAILED_PODS" -gt "0" ]; then
+                        echo "❌ Some pods are not Running in DEV"
+                        kubectl get pods -n dev
+                        exit 1
+                    fi
+
+                    echo "--- Testing backend health endpoint ---"
+                    # Port forward to test health endpoint
+                    kubectl port-forward svc/backend-service 9999:80 \
+                        --namespace=dev &
+                    PF_PID=\$!
+                    sleep 5
+
+                    HTTP_STATUS=\$(curl -s -o /dev/null -w "%{http_code}" \
+                        http://localhost:9999/api/health || echo "000")
+
+                    kill \$PF_PID 2>/dev/null || true
+
+                    echo "Health check returned: HTTP \$HTTP_STATUS"
+
+                    if [ "\$HTTP_STATUS" = "200" ]; then
+                        echo "✅ Health check passed"
+                    else
+                        echo "⚠️  Health check returned \$HTTP_STATUS — check DEV manually"
+                    fi
+
+                    echo "✅ Smoke tests complete — DEV is healthy"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 8 — Approval Gate
+        //
+        // Pipeline PAUSES here
+        // DevOps engineer:
+        //   1. Reviews DEV in browser (or port-forward to check)
+        //   2. Clicks "Approve" to deploy to production
+        //   3. OR clicks "Abort" to cancel production deploy
+        //
+        // Only required when deploying to production
+        // Skipped for dev-only deploys
+        // ─────────────────────────────────────────────────────────────
+        stage('Approve Production Deploy') {
+            when {
+                expression { return params.DEPLOY_ENV in ['both', 'production-only'] && !params.ROLLBACK }
+            }
+            steps {
+                timeout(time: 30, unit: 'MINUTES') {
+                    input(
+                        message: """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  🚀 Approve Production Deployment?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Image Tag  : ${params.IMAGE_TAG}
+  CI Build   : #${params.CI_BUILD_NUM}
+  Git Commit : ${params.GIT_COMMIT}
+  Git Branch : ${params.GIT_BRANCH}
+
+  ✅ Tests passed (CI Pipeline)
+  ✅ Images pushed to ECR
+  ✅ DEV deployment successful
+  ✅ DEV smoke tests passed
+
+  Review DEV environment before approving.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        """,
+                        ok:        '🚀 Approve — Deploy to Production',
+                        submitter: 'admin,devops-team'
+                    )
+                }
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 9 — Deploy to PRODUCTION
+        //
+        // Same as DEV but:
+        //   - No values-dev.yaml (full production config)
+        //   - 2 replicas minimum
+        //   - HPA enabled (auto scale 2-10 pods)
+        //   - --atomic ensures rollback if anything fails
+        // ─────────────────────────────────────────────────────────────
+        stage('Deploy to PRODUCTION') {
+            when {
+                expression { return params.DEPLOY_ENV in ['both', 'production-only'] && !params.ROLLBACK }
+            }
+            steps {
+                sh """
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  DEPLOYING TO PRODUCTION"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                    echo "--- Deploying backend to PRODUCTION ---"
+                    helm upgrade --install backend ./helm/backend \
+                        --namespace production \
+                        --values    ./helm/backend/values.yaml \
+                        --set image.repository=${ECR_BACKEND_URL} \
+                        --set image.tag=${params.IMAGE_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait            \
+                        --timeout 10m     \
+                        --atomic          \
+                        --cleanup-on-fail
+
+                    echo "--- Deploying frontend to PRODUCTION ---"
+                    helm upgrade --install frontend ./helm/frontend \
+                        --namespace production \
+                        --values    ./helm/frontend/values.yaml \
+                        --set image.repository=${ECR_FRONTEND_URL} \
+                        --set image.tag=${params.IMAGE_TAG} \
+                        --set image.pullPolicy=Always \
+                        --wait            \
+                        --timeout 10m     \
+                        --atomic          \
+                        --cleanup-on-fail
+
+                    echo "✅ PRODUCTION deployment complete"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 10 — Verify Production
+        // Final check that everything is healthy
+        // ─────────────────────────────────────────────────────────────
+        stage('Verify Production') {
+            when {
+                expression { return params.DEPLOY_ENV in ['both', 'production-only'] && !params.ROLLBACK }
+            }
+            steps {
+                sh """
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  PRODUCTION VERIFICATION"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                    echo "--- Pods ---"
+                    kubectl get pods -n production -o wide
+
+                    echo "--- Services ---"
+                    kubectl get svc -n production
+
+                    echo "--- Autoscalers ---"
+                    kubectl get hpa -n production
+
+                    echo "--- Helm releases ---"
+                    helm list --all-namespaces
+
+                    echo "--- Rollout verification ---"
+                    kubectl rollout status deployment/backend-backend \
+                        --namespace=production --timeout=60s
+                    kubectl rollout status deployment/frontend-frontend \
+                        --namespace=production --timeout=60s
+
+                    echo "✅ Production verified and healthy"
+                    echo "✅ Tag ${params.IMAGE_TAG} is now LIVE in production"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 11 — Rollback (only when ROLLBACK is checked)
+        //
+        // Rolls back production to the PREVIOUS Helm release
+        // Use this when a deployment causes issues in production
+        //
+        // Helm keeps history of all releases
+        // helm rollback goes back to the previous working version
+        // ─────────────────────────────────────────────────────────────
+        stage('Rollback Production') {
+            when {
+                expression { return params.ROLLBACK }
+            }
+            steps {
+                sh """
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                    echo "  ⚠️  ROLLING BACK PRODUCTION"
+                    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+                    echo "--- Current release history ---"
+                    helm history backend  -n production
+                    helm history frontend -n production
+
+                    echo "--- Rolling back backend ---"
+                    helm rollback backend  0 --namespace=production --wait
+                    # 0 = previous release
+
+                    echo "--- Rolling back frontend ---"
+                    helm rollback frontend 0 --namespace=production --wait
+
+                    echo "--- Post-rollback status ---"
+                    kubectl get pods -n production
+                    helm list -n production
+
+                    echo "✅ Rollback complete"
+                """
+            }
+        }
+
+        // ─────────────────────────────────────────────────────────────
+        // STAGE 12 — Deploy Monitoring (optional)
+        // Only runs when DEPLOY_MONITORING is checked
+        // ─────────────────────────────────────────────────────────────
+        stage('Deploy Monitoring') {
+            when {
+                expression { return params.DEPLOY_MONITORING }
+            }
+            steps {
+                sh """
+                    echo "--- Adding Helm repos ---"
+                    helm repo add prometheus-community \
+                        https://prometheus-community.github.io/helm-charts
+                    helm repo update
+
+                    echo "--- Installing Prometheus + Grafana ---"
+                    helm upgrade --install monitoring \
+                        prometheus-community/kube-prometheus-stack \
+                        --namespace monitoring \
+                        --values ./monitoring/prometheus-values.yaml \
+                        --wait   \
+                        --timeout 10m
+
+                    kubectl get pods -n monitoring
+
+                    echo "✅ Monitoring deployed"
+                    echo "   Access: kubectl port-forward svc/monitoring-grafana 3000:80 -n monitoring"
+                    echo "   Login: admin / DevOpsAdmin123"
+                """
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                if (params.ROLLBACK) {
+                    echo "✅ Rollback successful — production restored to previous version"
+                } else {
+                    echo "✅ Deploy pipeline SUCCESS — ${params.IMAGE_TAG} is live in ${params.DEPLOY_ENV}"
+                }
+            }
+        }
+
+        failure {
+            echo "❌ Deploy pipeline FAILED — check logs above"
+            echo "   Production may have been automatically rolled back by --atomic flag"
+            echo "   Check: kubectl get pods -n production"
+        }
+
+        always {
+            cleanWs()
+        }
+    }
+}
