@@ -160,7 +160,7 @@ pipeline {
         stage('Terraform Plan') {
             steps {
                 dir("${TF_DIR}") {
-                    sh """
+                    script{
                         echo "--- Terraform Plan (${params.ACTION}) ---"
 
                         ${params.ACTION == 'Destroy' ? '''
@@ -183,7 +183,7 @@ pipeline {
                         '''}
 
                         echo "✅ Plan complete"
-                    """
+                }
                 }
             }
             post {
