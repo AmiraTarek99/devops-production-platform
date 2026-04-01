@@ -158,13 +158,15 @@ pipeline {
         //   2 = changes are planned
         // ─────────────────────────────────────────────────────────────
         stage('Terraform Plan') {
-            steps {
-                dir("${TF_DIR}") {
-                    script{
-                        echo "--- Terraform Plan (${params.ACTION}) ---"
+    steps {
+        dir("${TF_DIR}") {
+            script {
+                echo "--- Terraform Plan (${params.ACTION}) ---"
 
-                        ${params.ACTION == 'Destroy' ? '''
-                        # Plan what would be destroyed
+                if (params.ACTION == 'Destroy') {
+                    sh """
+                        echo "Planning DESTROY..."
+
                         terraform plan \
                             -destroy \
                             -var="db_password=${DB_PASSWORD}" \
@@ -172,33 +174,32 @@ pipeline {
                             -var="aws_region=${AWS_REGION}" \
                             -input=false \
                             -out=tfplan
-                        ''' : '''
-                        # Plan what would be created/updated
+                    """
+                } else {
+                    sh """
+                        echo "Planning APPLY..."
+
                         terraform plan \
                             -var="db_password=${DB_PASSWORD}" \
                             -var="environment=${params.ENVIRONMENT}" \
                             -var="aws_region=${AWS_REGION}" \
                             -input=false \
                             -out=tfplan
-                        '''}
+                    """
+                }
 
-                        echo "✅ Plan complete"
-                }
-                }
-            }
-            post {
-
-                always {
-                    
-                         // Save plan as artifact so team can review
-                    archiveArtifacts artifacts: "${TF_DIR}/tfplan",
-                                     allowEmptyArchive: true,
-                                     fingerprint: true
-                    
-                   
-                }
+                echo "✅ Plan complete"
             }
         }
+    }
+    post {
+        always {
+            archiveArtifacts artifacts: "${TF_DIR}/tfplan",
+                             allowEmptyArchive: true,
+                             fingerprint: true
+        }
+    }
+}
 
         // ─────────────────────────────────────────────────────────────
         // STAGE 4 — Show Plan
