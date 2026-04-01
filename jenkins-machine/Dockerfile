@@ -2,49 +2,61 @@ FROM jenkins/jenkins:lts
 
 USER root
 
-# Avoid interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Clean + update + install (IMPORTANT FIX)
-RUN apt-get clean && \
-    rm -rf /var/lib/apt/lists/* && \
-    apt-get update -y && \
+# ─────────────────────────────
+# Base packages
+# ─────────────────────────────
+RUN apt-get update -y && \
     apt-get install -y \
         curl \
         unzip \
         gnupg \
         apt-transport-https \
         ca-certificates \
-        lsb-release && \
-    apt-get clean && \
+        lsb-release \
+        jq && \
     rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────
-# Install AWS CLI v2
+# Install AWS CLI v2 (latest)
 # ─────────────────────────────
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
-    && unzip awscliv2.zip \
-    && ./aws/install \
-    && rm -rf aws awscliv2.zip
+RUN curl -s "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip && \
+    unzip -q awscliv2.zip && \
+    ./aws/install && \
+    rm -rf aws awscliv2.zip
 
 # ─────────────────────────────
-# Install Terraform
+# Install Terraform (latest)
 # ─────────────────────────────
-RUN curl -LO https://releases.hashicorp.com/terraform/1.14.8/terraform_1.14.8_linux_amd64.zip && \
-    unzip terraform_1.14.8_linux_amd64.zip -d /usr/local/bin && \
-    rm terraform_1.14.8_linux_amd64.zip
+RUN TERRAFORM_VERSION=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | jq -r .tag_name | sed 's/v//') && \
+    curl -LO https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip && \
+    unzip terraform_${TERRAFORM_VERSION}_linux_amd64.zip -d /usr/local/bin && \
+    rm terraform_${TERRAFORM_VERSION}_linux_amd64.zip
 
 # ─────────────────────────────
-# Install kubectl
+# Install kubectl (latest stable)
 # ─────────────────────────────
-RUN curl -LO "https://dl.k8s.io/release/v1.29.0/bin/linux/amd64/kubectl" \
-    && install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+RUN KUBECTL_VERSION=$(curl -L -s https://dl.k8s.io/release/stable.txt) && \
+    curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" && \
+    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
+    rm kubectl
 
 # ─────────────────────────────
-# Install Helm
+# Install Helm (latest)
 # ─────────────────────────────
-RUN curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+RUN HELM_VERSION=$(curl -s https://api.github.com/repos/helm/helm/releases/latest | jq -r .tag_name) && \
+    curl -LO https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz && \
+    tar -zxvf helm-${HELM_VERSION}-linux-amd64.tar.gz && \
+    mv linux-amd64/helm /usr/local/bin/helm && \
+    rm -rf linux-amd64 helm-${HELM_VERSION}-linux-amd64.tar.gz
 
-
+# ─────────────────────────────
+# Verify installations (optional but recommended)
+# ─────────────────────────────
+RUN terraform -version && \
+    kubectl version --client && \
+    helm version && \
+    aws --version
 
 USER jenkins
