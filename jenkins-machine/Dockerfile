@@ -30,10 +30,9 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
 # ─────────────────────────────
 # Install Terraform
 # ─────────────────────────────
-RUN curl -LO https://releases.hashicorp.com/terraform/1.6.6/terraform_1.6.6_linux_amd64.zip \
-    && unzip terraform_1.6.6_linux_amd64.zip \
-    && mv terraform /usr/local/bin/ \
-    && rm terraform_1.6.6_linux_amd64.zip
+RUN curl -LO https://releases.hashicorp.com/terraform/1.14.8/terraform_1.14.8_linux_amd64.zip && \
+    unzip terraform_1.14.8_linux_amd64.zip -d /usr/local/bin && \
+    rm terraform_1.14.8_linux_amd64.zip
 
 # ─────────────────────────────
 # Install kubectl

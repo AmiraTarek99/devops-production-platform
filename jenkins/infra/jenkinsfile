@@ -93,27 +93,6 @@ pipeline {
     stages {
 
 
-
-        stage('Download Terraform') {
-            steps {
-                script {
-                    if (!fileExists("${TF_BIN}")) {
-                        echo "Downloading Terraform ${TF_VERSION}..."
-                        sh """
-                            curl -L -o terraform.zip https://releases.hashicorp.com/terraform/${TF_VERSION}/terraform_${TF_VERSION}_linux_amd64.zip
-                            unzip terraform.zip
-                            chmod +x terraform
-                            rm terraform.zip
-                        """
-                        echo "Terraform downloaded and ready in workspace"
-                    } else {
-                        echo "Terraform already exists in workspace, skipping download"
-                    }
-                    sh "${TF_BIN} -v"
-                }
-            }
-        }
-
         // ─────────────────────────────────────────────────────────────
         // STAGE 1 — Checkout
         // Pull latest Terraform code from GitHub
