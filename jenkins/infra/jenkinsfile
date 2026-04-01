@@ -70,6 +70,7 @@ pipeline {
     }
 
     environment {
+        AWS_CREDS = credentials('aws-secret')
         AWS_REGION  = 'us-east-1'
         DB_PASSWORD = credentials('DB_PASSWORD')
         TF_DIR      = 'terraform/infrastructure'
