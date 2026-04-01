@@ -39,7 +39,7 @@ variable "private_subnets" {
 
 variable "eks_cluster_version" {
   type    = string
-  default = "1.29"
+  default = "1.35"
 }
 
 variable "db_password" {

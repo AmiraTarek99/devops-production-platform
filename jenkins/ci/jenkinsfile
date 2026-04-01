@@ -34,6 +34,7 @@ pipeline {
 
     environment {
         AWS_REGION       = 'us-east-1'
+        AWS_CREDS = credentials('aws-secret')
         ECR_BACKEND_URL  = credentials('ECR_BACKEND_URL')
         ECR_FRONTEND_URL = credentials('ECR_FRONTEND_URL')
 
