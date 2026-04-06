@@ -5,7 +5,7 @@ USER root
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ─────────────────────────────
-# Base packages
+# Base packages + Python 3.11
 # ─────────────────────────────
 RUN apt-get update -y && \
     apt-get install -y \

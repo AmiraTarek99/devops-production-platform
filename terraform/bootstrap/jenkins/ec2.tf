@@ -60,13 +60,13 @@ resource "aws_iam_instance_profile" "jenkins" {
   role = aws_iam_role.jenkins.name
 }
 
-data "aws_ami" "amazon_linux" {
+data "aws_ami" "ubuntu" {
   most_recent = true
-  owners      = ["amazon"]
+  owners      = ["099720109477"] # Canonical (official Ubuntu)
 
   filter {
     name   = "name"
-    values = ["amzn2-ami-hvm-*-x86_64-gp2"]
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"]
   }
 
   filter {
@@ -76,8 +76,8 @@ data "aws_ami" "amazon_linux" {
 }
 
 resource "aws_instance" "jenkins" {
-  ami                    = data.aws_ami.amazon_linux.id
-  instance_type          = "t3.medium"
+  ami                    = data.aws_ami.ubuntu.id
+  instance_type          = "t3.micro"
   subnet_id              = aws_subnet.jenkins_public.id
   vpc_security_group_ids = [aws_security_group.jenkins.id]
   iam_instance_profile   = aws_iam_instance_profile.jenkins.name
